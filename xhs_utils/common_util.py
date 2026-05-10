@@ -33,7 +33,11 @@ def init():
         if not os.path.exists(base_path):
             os.makedirs(base_path)
             logger.info(f'创建目录 {base_path}')
-    cookies_str = load_env()
+
+    from xhs_utils.cookie_provider import resolve
+    result = resolve()
+    cookies_str = result[0] if result else None
+
     base_path = {
         'media': media_base_path,
         'excel': excel_base_path,

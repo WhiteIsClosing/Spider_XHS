@@ -2,6 +2,7 @@ __pycache__
 node_modules/
 .env
 datas/
+.xhs_profile/
 *.so
 .Python
 build/

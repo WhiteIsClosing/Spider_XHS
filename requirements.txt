@@ -8,3 +8,5 @@ aiohttp
 opencv-python
 numpy
 qrcode
+browser-cookie3
+playwright
