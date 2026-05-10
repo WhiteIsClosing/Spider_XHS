@@ -6,10 +6,10 @@ import binascii
 import json
 
 import execjs
-import requests
 from loguru import logger
 from dotenv import load_dotenv
 
+from xhs_utils import http_util as requests
 from xhs_utils.http_util import REQUEST_TIMEOUT
 from xhs_utils.xhs_creator_util import generate_xsc
 

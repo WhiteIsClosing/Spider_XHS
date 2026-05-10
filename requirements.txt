@@ -10,3 +10,4 @@ numpy
 qrcode
 browser-cookie3
 playwright
+curl_cffi

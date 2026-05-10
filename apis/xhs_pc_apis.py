@@ -2,7 +2,7 @@
 import json
 import re
 import urllib
-import requests
+from xhs_utils import http_util as requests
 from xhs_utils.xhs_util import splice_str, generate_request_params, generate_x_b3_traceid, generate_search_id, generate_search_request_id, generate_x_rap_param, get_common_headers
 from xhs_utils.http_util import REQUEST_TIMEOUT
 from loguru import logger

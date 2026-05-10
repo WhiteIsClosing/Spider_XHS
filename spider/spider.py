@@ -11,7 +11,13 @@ from xhs_utils.data_util import (
     download_note, save_to_xlsx,
     filter_comments, filter_users, save_to_csv,
 )
-from xhs_utils.http_util import random_delay, rate_limited_delay, reset_request_counter
+from xhs_utils.http_util import (
+    random_delay,
+    rate_limited_delay,
+    reset_request_counter,
+    configure_budget,
+    SessionBudgetExceeded,
+)
 from xhs_utils.llm_util import analyze_dating_tendency, is_marketing_account
 
 
@@ -39,6 +45,50 @@ class Data_Spider():
             if _is_session_expired(msg):
                 raise SessionExpiredError(f'Cookie 已失效: {msg}')
             logger.warning(f'[Session] 探测失败（非登录问题）: {msg}')
+
+    def _warmup_session(self, cookies_str: str, proxies=None) -> None:
+        """模拟真人落地：先逛首页推荐若干屏，再开始检索。
+
+        每篇 dwell 时间走 lognormal 长尾，分布像人在刷推荐。任一步失败就提前
+        中止预热——主流程的 check_session 已经跑过，预热失败不致命。
+        """
+        logger.info('[Warmup] 浏览首页推荐 ...')
+        random_delay(2.0, 6.0)
+        success, msg, channel_json = self.xhs_apis.get_homefeed_all_channel(cookies_str, proxies)
+        if not success:
+            logger.debug(f'[Warmup] homefeed/category 失败，跳过预热: {msg}')
+            return
+
+        categories: list[str] = []
+        try:
+            for c in (channel_json or {}).get('data', []) or []:
+                cid = c.get('id')
+                if cid:
+                    categories.append(cid)
+        except Exception:
+            pass
+        if not categories:
+            categories = ['homefeed_recommend']
+
+        chosen = random.choice(categories)
+        n_pages = random.randint(1, 3)
+        cursor_score = ''
+        note_index = 0
+        for i in range(n_pages):
+            random_delay(3.0, 12.0)
+            refresh_type = 1 if i == 0 else 3
+            success, msg, res = self.xhs_apis.get_homefeed_recommend(
+                chosen, cursor_score, refresh_type, note_index, cookies_str, proxies,
+            )
+            if not success:
+                logger.debug(f'[Warmup] homefeed page {i + 1} failed: {msg}; abort warmup')
+                return
+            try:
+                cursor_score = res['data'].get('cursor_score', '') if res else ''
+                note_index += 20
+            except Exception:
+                return
+        logger.info(f'[Warmup] 完成（category={chosen}, pages={n_pages}）')
 
     def _maybe_keepalive(self, cookies_str: str, proxies=None, interval: float = 600.0) -> None:
         """距上次心跳超过 interval 秒时，发一次轻量请求保持 session 活跃。"""
@@ -164,6 +214,8 @@ class Data_Spider():
         delay_range: tuple = (5.0, 15.0),
         cooldown_every: int = 10,
         cooldown_range: tuple = (60.0, 120.0),
+        max_requests: int = 80,
+        max_minutes: float = 30.0,
         proxies: dict = None,
     ):
         """
@@ -179,11 +231,15 @@ class Data_Spider():
         :param user_filter_age_range   年龄区间 (min, max)，如 (35, 45)，None 表示不过滤
         :param user_filter_fans_max    粉丝数上限（不含），如 1000，None 表示不过滤
         :param delay_range             每次请求间随机延迟范围 (min_s, max_s)，默认 5~15s
+                                       （走 lognormal，median = 几何均值，长尾自然出现）
         :param cooldown_every          每隔 N 次请求触发一次长冷却，默认 10
         :param cooldown_range          长冷却时长范围 (min_s, max_s)，默认 60~120s
+        :param max_requests            单次会话最大请求数，超过后保存部分结果并退出
+        :param max_minutes             单次会话最大墙钟分钟，到点保存部分结果并退出
         :param proxies                 代理配置
         """
         reset_request_counter()
+        configure_budget(max_requests=max_requests, max_minutes=max_minutes)
         all_filtered_comments = []
         all_final_users = []
         seen_user_ids: set = set()
@@ -193,6 +249,13 @@ class Data_Spider():
         self.check_session(cookies_str, proxies)
         self._last_keepalive = time.time()
         logger.info('[Pipeline] Cookie 有效')
+
+        # 预热：模拟真人先逛一会儿首页推荐再去搜索
+        try:
+            self._warmup_session(cookies_str, proxies)
+        except SessionBudgetExceeded as e:
+            logger.warning(f'[Pipeline] 预热阶段就触顶预算: {e}')
+            return [], [], False, str(e)
 
         # Step 1: 按时间排序搜索笔记
         logger.info(f'[Pipeline] 搜索关键词: {query}，数量: {note_num}')
@@ -222,91 +285,101 @@ class Data_Spider():
         logger.info(f'[Pipeline] 有效笔记 {len(valid_notes)} 篇（已打乱顺序），开始深度优先处理')
 
         # 深度优先：每篇笔记独立走完 评论→过滤→用户→LLM 全流程
-        for note in valid_notes:
-            note_url = f"https://www.xiaohongshu.com/explore/{note['id']}?xsec_token={note['xsec_token']}"
+        budget_hit = False
+        try:
+            for note in valid_notes:
+                note_url = f"https://www.xiaohongshu.com/explore/{note['id']}?xsec_token={note['xsec_token']}"
 
-            # Step 2: 拉取本篇笔记评论
-            self._maybe_keepalive(cookies_str, proxies)
-            rate_limited_delay(*delay_range, cooldown_every=cooldown_every,
-                               cooldown_min=cooldown_range[0], cooldown_max=cooldown_range[1])
-            success, msg, out_comments = self.xhs_apis.get_note_all_comment(note_url, cookies_str, proxies)
-            if not success:
-                if _is_session_expired(msg):
-                    raise SessionExpiredError(f'爬评论时 Cookie 失效: {msg}')
-                logger.warning(f'[Pipeline] 评论获取失败 {note_url}: {msg}')
-                continue
-
-            note_comments = []
-            for comment in out_comments:
-                note_comments.append(handle_comment_info({**comment, 'note_url': note_url}))
-                for sub in comment.get('sub_comments', []):
-                    note_comments.append(handle_comment_info({**sub, 'note_url': note_url}))
-
-            # Step 3: 按省份 + 时间过滤本篇评论
-            filtered = filter_comments(note_comments, comment_filter_regions, comment_filter_days)
-            all_filtered_comments.extend(filtered)
-
-            # Steps 4-6: 对本篇新出现的候选用户逐一完成全流程
-            for c in filtered:
-                uid = c.get('user_id')
-                if not uid or uid in seen_user_ids:
-                    continue
-                seen_user_ids.add(uid)
-
-                # Step 4: 拉取用户信息
+                # Step 2: 拉取本篇笔记评论
                 self._maybe_keepalive(cookies_str, proxies)
                 rate_limited_delay(*delay_range, cooldown_every=cooldown_every,
                                    cooldown_min=cooldown_range[0], cooldown_max=cooldown_range[1])
-                success, msg, res_json = self.xhs_apis.get_user_info(uid, cookies_str, proxies)
-                if not success or not res_json:
+                success, msg, out_comments = self.xhs_apis.get_note_all_comment(note_url, cookies_str, proxies)
+                if not success:
                     if _is_session_expired(msg):
-                        raise SessionExpiredError(f'拉用户信息时 Cookie 失效: {msg}')
-                    logger.warning(f'[Pipeline] 用户信息获取失败 {uid}: {msg}')
-                    continue
-                try:
-                    user_info = handle_user_info(res_json['data'], uid)
-                except Exception as e:
-                    logger.warning(f'[Pipeline] 用户信息解析失败 {uid}: {e}')
+                        raise SessionExpiredError(f'爬评论时 Cookie 失效: {msg}')
+                    logger.warning(f'[Pipeline] 评论获取失败 {note_url}: {msg}')
                     continue
 
-                # Step 5: 人口属性过滤（性别 / 年龄 / 粉丝数）
-                if not filter_users([user_info], user_filter_genders, user_filter_age_range, user_filter_fans_max):
-                    continue
+                note_comments = []
+                for comment in out_comments:
+                    note_comments.append(handle_comment_info({**comment, 'note_url': note_url}))
+                    for sub in comment.get('sub_comments', []):
+                        note_comments.append(handle_comment_info({**sub, 'note_url': note_url}))
 
-                # Step 5b: LLM 过滤营销号
-                mkt = is_marketing_account(user_info.get('nickname', ''), user_info.get('desc', ''), user_info.get('tags', []))
-                if mkt.get('is_marketing'):
-                    logger.info(f'[Pipeline] 过滤营销号 {user_info["nickname"]}: {mkt.get("reason", "")}')
-                    continue
+                # Step 3: 按省份 + 时间过滤本篇评论
+                filtered = filter_comments(note_comments, comment_filter_regions, comment_filter_days)
+                all_filtered_comments.extend(filtered)
 
-                # Step 6: 拉取用户笔记标题 → LLM 分析交友倾向
-                note_titles = []
-                try:
+                # Steps 4-6: 对本篇新出现的候选用户逐一完成全流程
+                for c in filtered:
+                    uid = c.get('user_id')
+                    if not uid or uid in seen_user_ids:
+                        continue
+                    seen_user_ids.add(uid)
+
+                    # Step 4: 拉取用户信息
                     self._maybe_keepalive(cookies_str, proxies)
                     rate_limited_delay(*delay_range, cooldown_every=cooldown_every,
                                        cooldown_min=cooldown_range[0], cooldown_max=cooldown_range[1])
-                    success, msg, nres = self.xhs_apis.get_user_note_info(uid, '', cookies_str, proxies=proxies)
-                    if success and nres:
-                        for n in nres.get('data', {}).get('notes', [])[:10]:
-                            title = (
-                                n.get('display_title') or n.get('title')
-                                or n.get('note_card', {}).get('display_title', '')
-                                or n.get('note_card', {}).get('title', '')
-                            )
-                            if title:
-                                note_titles.append(title)
-                except Exception as e:
-                    logger.warning(f'[Pipeline] 获取笔记标题失败 {uid}: {e}')
+                    success, msg, res_json = self.xhs_apis.get_user_info(uid, cookies_str, proxies)
+                    if not success or not res_json:
+                        if _is_session_expired(msg):
+                            raise SessionExpiredError(f'拉用户信息时 Cookie 失效: {msg}')
+                        logger.warning(f'[Pipeline] 用户信息获取失败 {uid}: {msg}')
+                        continue
+                    try:
+                        user_info = handle_user_info(res_json['data'], uid)
+                    except Exception as e:
+                        logger.warning(f'[Pipeline] 用户信息解析失败 {uid}: {e}')
+                        continue
 
-                tendency = analyze_dating_tendency(user_info.get('desc', ''), note_titles)
-                user_info['dating_tendency'] = tendency.get('tendency', '未分析')
-                user_info['dating_reason'] = tendency.get('reason', '')
-                all_final_users.append(user_info)
-                logger.info(f'[Pipeline] 新增用户 {user_info["nickname"]} → {user_info["dating_tendency"]}')
+                    # Step 5: 人口属性过滤（性别 / 年龄 / 粉丝数）
+                    if not filter_users([user_info], user_filter_genders, user_filter_age_range, user_filter_fans_max):
+                        continue
+
+                    # Step 5b: LLM 过滤营销号
+                    mkt = is_marketing_account(user_info.get('nickname', ''), user_info.get('desc', ''), user_info.get('tags', []))
+                    if mkt.get('is_marketing'):
+                        logger.info(f'[Pipeline] 过滤营销号 {user_info["nickname"]}: {mkt.get("reason", "")}')
+                        continue
+
+                    # Step 6: 拉取用户笔记标题 → LLM 分析交友倾向
+                    note_titles = []
+                    try:
+                        self._maybe_keepalive(cookies_str, proxies)
+                        rate_limited_delay(*delay_range, cooldown_every=cooldown_every,
+                                           cooldown_min=cooldown_range[0], cooldown_max=cooldown_range[1])
+                        success, msg, nres = self.xhs_apis.get_user_note_info(uid, '', cookies_str, proxies=proxies)
+                        if success and nres:
+                            for n in nres.get('data', {}).get('notes', [])[:10]:
+                                title = (
+                                    n.get('display_title') or n.get('title')
+                                    or n.get('note_card', {}).get('display_title', '')
+                                    or n.get('note_card', {}).get('title', '')
+                                )
+                                if title:
+                                    note_titles.append(title)
+                    except SessionBudgetExceeded:
+                        raise
+                    except Exception as e:
+                        logger.warning(f'[Pipeline] 获取笔记标题失败 {uid}: {e}')
+
+                    tendency = analyze_dating_tendency(user_info.get('desc', ''), note_titles)
+                    user_info['dating_tendency'] = tendency.get('tendency', '未分析')
+                    user_info['dating_reason'] = tendency.get('reason', '')
+                    all_final_users.append(user_info)
+                    logger.info(f'[Pipeline] 新增用户 {user_info["nickname"]} → {user_info["dating_tendency"]}')
+        except SessionBudgetExceeded as e:
+            budget_hit = True
+            logger.warning(
+                f'[Pipeline] 会话预算到顶: {e}; 已收集评论 {len(all_filtered_comments)} 条，'
+                f'用户 {len(all_final_users)} 人。停止并保存部分结果。'
+            )
 
         logger.info(f'[Pipeline] 完成。过滤评论 {len(all_filtered_comments)} 条，最终用户 {len(all_final_users)} 人')
 
-        # Step 7: 保存 CSV
+        # Step 7: 保存 CSV（即使预算耗尽也保存已收集到的部分）
         ts = datetime.now().strftime('%Y%m%d_%H%M%S')
         safe_query = query.replace('/', '_').replace('\\', '_')[:20]
         comment_csv = os.path.join(base_path['excel'], f'{safe_query}_评论_{ts}.csv')
@@ -314,7 +387,8 @@ class Data_Spider():
         save_to_csv(all_filtered_comments, comment_csv, type='comment')
         save_to_csv(all_final_users, user_csv, type='user')
 
-        return all_filtered_comments, all_final_users, True, 'ok'
+        msg = 'partial: budget exceeded' if budget_hit else 'ok'
+        return all_filtered_comments, all_final_users, True, msg
 
 
 if __name__ == '__main__':
