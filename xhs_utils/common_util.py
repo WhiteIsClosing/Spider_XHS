@@ -9,8 +9,10 @@ import execjs
 from loguru import logger
 from dotenv import load_dotenv
 
+from xhs_utils import http_util
 from xhs_utils import http_util as requests
 from xhs_utils.http_util import REQUEST_TIMEOUT
+from xhs_utils.cookie_util import trans_cookies
 from xhs_utils.xhs_creator_util import generate_xsc
 
 _STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'static')
@@ -26,6 +28,30 @@ def load_env():
     return cookies_str
 
 
+def _a1_of(cookies_str):
+    try:
+        return trans_cookies(cookies_str).get('a1')
+    except Exception:
+        return None
+
+
+def _prefer_persisted_cookie(resolved, live_path):
+    """Reuse last run's rolled cookie iff it's the same identity (same a1).
+
+    The supplied cookie may be freshly pasted for a *different* account, so we
+    only fall back to the persisted/aged one when a1 matches.
+    """
+    persisted = http_util.load_persisted_cookies(live_path)
+    if not persisted:
+        return resolved
+    if not resolved:
+        return persisted
+    if _a1_of(persisted) and _a1_of(persisted) == _a1_of(resolved):
+        logger.info('[Cookie] 复用上次滚动后的 cookie（同一身份 a1）')
+        return persisted
+    return resolved
+
+
 def init():
     media_base_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../datas/media_datas'))
     excel_base_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../datas/excel_datas'))
@@ -38,9 +64,19 @@ def init():
     result = resolve()
     cookies_str = result[0] if result else None
 
+    # 跨运行复用滚动后的 cookie，并把最终 cookie 种入 HTTP 层的滚动存储
+    live_cookie_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '.xhs_cookies_live'))
+    cookies_str = _prefer_persisted_cookie(cookies_str, live_cookie_path)
+    if cookies_str:
+        http_util.seed_cookies(cookies_str)
+
+    quota_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '.xhs_quota.json'))
+
     base_path = {
         'media': media_base_path,
         'excel': excel_base_path,
+        'cookie_live': live_cookie_path,
+        'quota': quota_path,
     }
     return cookies_str, base_path
 

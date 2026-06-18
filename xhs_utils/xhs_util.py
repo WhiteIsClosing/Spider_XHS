@@ -7,7 +7,7 @@ from urllib.parse import urlencode
 
 import execjs
 from xhs_utils.cookie_util import trans_cookies
-from xhs_utils.http_util import get_random_user_agent
+from xhs_utils.http_util import get_client_hint_headers
 
 _STATIC_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'static'))
 
@@ -73,6 +73,7 @@ def generate_x_rap_param(api, data, app_id=None):
     return _get_static_js('xhs_rap.js').call('generate_x_rap_param', api, data or '', app_id)
 
 def get_common_headers():
+    ch = get_client_hint_headers()
     return {
         "authority": "www.xiaohongshu.com",
         "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
@@ -80,17 +81,18 @@ def get_common_headers():
         "cache-control": "no-cache",
         "pragma": "no-cache",
         "referer": "https://www.xiaohongshu.com/",
-        "sec-ch-ua": "\"Chromium\";v=\"122\", \"Not(A:Brand\";v=\"24\", \"Google Chrome\";v=\"122\"",
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": "\"Windows\"",
+        "sec-ch-ua": ch["sec-ch-ua"],
+        "sec-ch-ua-mobile": ch["sec-ch-ua-mobile"],
+        "sec-ch-ua-platform": ch["sec-ch-ua-platform"],
         "sec-fetch-dest": "document",
         "sec-fetch-mode": "navigate",
         "sec-fetch-site": "same-origin",
         "sec-fetch-user": "?1",
         "upgrade-insecure-requests": "1",
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        "user-agent": ch["user-agent"]
     }
 def get_request_headers_template():
+    ch = get_client_hint_headers()
     return {
         "authority": "edith.xiaohongshu.com",
         "accept": "application/json, text/plain, */*",
@@ -100,13 +102,13 @@ def get_request_headers_template():
         "origin": "https://www.xiaohongshu.com",
         "pragma": "no-cache",
         "referer": "https://www.xiaohongshu.com/",
-        "sec-ch-ua": "\"Not A(Brand\";v=\"99\", \"Microsoft Edge\";v=\"121\", \"Chromium\";v=\"121\"",
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": "\"Windows\"",
+        "sec-ch-ua": ch["sec-ch-ua"],
+        "sec-ch-ua-mobile": ch["sec-ch-ua-mobile"],
+        "sec-ch-ua-platform": ch["sec-ch-ua-platform"],
         "sec-fetch-dest": "empty",
         "sec-fetch-mode": "cors",
         "sec-fetch-site": "same-site",
-        "user-agent": get_random_user_agent(),
+        "user-agent": ch["user-agent"],
         "x-b3-traceid": "",
         "x-mns": "unload",
         "x-s": "",
@@ -128,6 +130,31 @@ def generate_headers(a1, api, data='', method='POST', referer=None):
     if data:
         data = json.dumps(data, separators=(',', ':'), ensure_ascii=False)
     return headers, data
+
+def verify_signature_toolchain():
+    """Offline sanity check that the signing JS toolchain actually runs.
+
+    Catches a missing/broken Node, an execjs failure, or a corrupted static JS
+    bundle *before* the crawl burns the cookie firing malformed signatures at
+    the server. Raises RuntimeError (with guidance) on failure; returns the
+    probe signature on success.
+    """
+    probe_a1 = 'a' * 52
+    api = '/api/sns/web/v1/homefeed/category'
+    try:
+        xs, xt, xs_common = generate_xs_xs_common(probe_a1, api, '', 'GET')
+    except Exception as e:
+        raise RuntimeError(
+            f'签名工具链不可用（execjs/Node 执行失败）: {e}。'
+            f'请确认已安装 Node.js，且 static/ 目录下的签名 JS 完整。'
+        ) from e
+    if not (xs and xt and str(xs_common).strip()):
+        raise RuntimeError(
+            '签名工具链返回空值（x-s / x-t / x-s-common 之一为空），签名 JS 可能损坏'
+            '或与当前版本不匹配，请更新 static/ 目录下的签名脚本。'
+        )
+    return {'x-s': xs, 'x-t': xt, 'x-s-common': xs_common}
+
 
 def generate_request_params(cookies_str, api, data='', method='POST', referer=None):
     cookies = trans_cookies(cookies_str)
