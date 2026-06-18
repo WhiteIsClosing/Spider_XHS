@@ -16,7 +16,10 @@ from xhs_utils.http_util import (
     rate_limited_delay,
     reset_request_counter,
     configure_budget,
+    reset_risk_state,
+    persist_cookies,
     SessionBudgetExceeded,
+    CircuitBreakerOpen,
 )
 from xhs_utils.llm_util import analyze_dating_tendency, is_marketing_account
 
@@ -239,6 +242,7 @@ class Data_Spider():
         :param proxies                 代理配置
         """
         reset_request_counter()
+        reset_risk_state()
         configure_budget(max_requests=max_requests, max_minutes=max_minutes)
         all_filtered_comments = []
         all_final_users = []
@@ -256,15 +260,25 @@ class Data_Spider():
         except SessionBudgetExceeded as e:
             logger.warning(f'[Pipeline] 预热阶段就触顶预算: {e}')
             return [], [], False, str(e)
+        except CircuitBreakerOpen as e:
+            logger.error(f'[Pipeline] 预热阶段触发风控熔断: {e}')
+            return [], [], False, str(e)
 
         # Step 1: 按时间排序搜索笔记
         logger.info(f'[Pipeline] 搜索关键词: {query}，数量: {note_num}')
-        success, msg, notes = self.xhs_apis.search_some_note(
-            query, note_num, cookies_str,
-            sort_type_choice=1,  # 最新
-            note_type=2,         # 只要图文，过滤视频
-            proxies=proxies,
-        )
+        try:
+            success, msg, notes = self.xhs_apis.search_some_note(
+                query, note_num, cookies_str,
+                sort_type_choice=1,  # 最新
+                note_type=2,         # 只要图文，过滤视频
+                proxies=proxies,
+            )
+        except SessionBudgetExceeded as e:
+            logger.warning(f'[Pipeline] 搜索阶段触顶预算: {e}')
+            return [], [], False, str(e)
+        except CircuitBreakerOpen as e:
+            logger.error(f'[Pipeline] 搜索阶段触发风控熔断: {e}')
+            return [], [], False, str(e)
         if not success:
             if _is_session_expired(msg):
                 raise SessionExpiredError(f'搜索时 Cookie 失效: {msg}')
@@ -286,6 +300,7 @@ class Data_Spider():
 
         # 深度优先：每篇笔记独立走完 评论→过滤→用户→LLM 全流程
         budget_hit = False
+        stop_reason = None
         try:
             for note in valid_notes:
                 note_url = f"https://www.xiaohongshu.com/explore/{note['id']}?xsec_token={note['xsec_token']}"
@@ -372,9 +387,17 @@ class Data_Spider():
                     logger.info(f'[Pipeline] 新增用户 {user_info["nickname"]} → {user_info["dating_tendency"]}')
         except SessionBudgetExceeded as e:
             budget_hit = True
+            stop_reason = 'budget'
             logger.warning(
                 f'[Pipeline] 会话预算到顶: {e}; 已收集评论 {len(all_filtered_comments)} 条，'
                 f'用户 {len(all_final_users)} 人。停止并保存部分结果。'
+            )
+        except CircuitBreakerOpen as e:
+            budget_hit = True
+            stop_reason = 'circuit'
+            logger.error(
+                f'[Pipeline] 风控熔断: {e}; 已收集评论 {len(all_filtered_comments)} 条，'
+                f'用户 {len(all_final_users)} 人。立即停止并保存部分结果。'
             )
 
         logger.info(f'[Pipeline] 完成。过滤评论 {len(all_filtered_comments)} 条，最终用户 {len(all_final_users)} 人')
@@ -387,7 +410,17 @@ class Data_Spider():
         save_to_csv(all_filtered_comments, comment_csv, type='comment')
         save_to_csv(all_final_users, user_csv, type='user')
 
-        msg = 'partial: budget exceeded' if budget_hit else 'ok'
+        # 持久化滚动后的 cookie，供下次同身份运行复用（养活这唯一的 cookie）
+        live_path = base_path.get('cookie_live')
+        if live_path:
+            persist_cookies(live_path)
+
+        if stop_reason == 'circuit':
+            msg = 'partial: risk circuit breaker tripped'
+        elif stop_reason == 'budget':
+            msg = 'partial: budget exceeded'
+        else:
+            msg = 'ok'
         return all_filtered_comments, all_final_users, True, msg
 
 

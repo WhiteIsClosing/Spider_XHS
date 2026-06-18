@@ -3,6 +3,7 @@ node_modules/
 .env
 datas/
 .xhs_profile/
+.xhs_cookies_live
 *.so
 .Python
 build/
