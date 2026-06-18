@@ -70,10 +70,13 @@ def init():
     if cookies_str:
         http_util.seed_cookies(cookies_str)
 
+    quota_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '.xhs_quota.json'))
+
     base_path = {
         'media': media_base_path,
         'excel': excel_base_path,
         'cookie_live': live_cookie_path,
+        'quota': quota_path,
     }
     return cookies_str, base_path
 

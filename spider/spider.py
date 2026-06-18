@@ -16,15 +16,23 @@ from xhs_utils.http_util import (
     rate_limited_delay,
     reset_request_counter,
     configure_budget,
+    configure_daily_quota,
     reset_risk_state,
     persist_cookies,
+    is_risk_message,
     SessionBudgetExceeded,
     CircuitBreakerOpen,
 )
+from xhs_utils.xhs_util import verify_signature_toolchain
 from xhs_utils.llm_util import analyze_dating_tendency, is_marketing_account
 
 
 class SessionExpiredError(Exception):
+    pass
+
+
+class SignatureStaleError(Exception):
+    """签名算法疑似过期：请求被服务端以非登录、非风控的原因持续拒绝。"""
     pass
 
 
@@ -42,12 +50,29 @@ class Data_Spider():
         self._last_keepalive: float = time.time()
 
     def check_session(self, cookies_str: str, proxies=None) -> None:
-        """快速探测 cookie 是否有效，无效则抛出 SessionExpiredError。"""
-        success, msg, _ = self.xhs_apis.get_homefeed_all_channel(cookies_str, proxies)
-        if not success:
+        """探测 cookie / 签名健康度。
+
+        - 登录失效   → SessionExpiredError
+        - 疑似风控   → 仅告警（让运行期的熔断机制处理）
+        - 非登录非风控且连续两次被拒 → SignatureStaleError（签名算法可能已过期）
+        """
+        for attempt in (1, 2):
+            success, msg, _ = self.xhs_apis.get_homefeed_all_channel(cookies_str, proxies)
+            if success:
+                return
             if _is_session_expired(msg):
                 raise SessionExpiredError(f'Cookie 已失效: {msg}')
-            logger.warning(f'[Session] 探测失败（非登录问题）: {msg}')
+            if is_risk_message(msg):
+                logger.warning(f'[Session] 探测到疑似风控信号（非签名问题）: {msg}')
+                return
+            if attempt == 1:
+                logger.warning(f'[Session] 首次探测异常（疑似签名过期），重试确认: {msg}')
+                random_delay(2.0, 5.0)
+                continue
+            raise SignatureStaleError(
+                f'连续两次签名请求被拒（非登录 / 非风控），签名算法可能已过期，'
+                f'请更新 static/ 目录下的签名 JS。最后错误: {msg}'
+            )
 
     def _warmup_session(self, cookies_str: str, proxies=None) -> None:
         """模拟真人落地：先逛首页推荐若干屏，再开始检索。
@@ -219,6 +244,7 @@ class Data_Spider():
         cooldown_range: tuple = (60.0, 120.0),
         max_requests: int = 80,
         max_minutes: float = 30.0,
+        max_requests_per_day: int = 300,
         proxies: dict = None,
     ):
         """
@@ -239,11 +265,20 @@ class Data_Spider():
         :param cooldown_range          长冷却时长范围 (min_s, max_s)，默认 60~120s
         :param max_requests            单次会话最大请求数，超过后保存部分结果并退出
         :param max_minutes             单次会话最大墙钟分钟，到点保存部分结果并退出
+        :param max_requests_per_day    单个身份单日最大请求数（跨重启持久化），默认 300
         :param proxies                 代理配置
         """
+        # 启动自检：签名工具链能否离线跑通（Node/execjs/静态 JS 完整性）
+        try:
+            verify_signature_toolchain()
+            logger.info('[Pipeline] 签名工具链自检通过')
+        except RuntimeError as e:
+            raise SignatureStaleError(str(e)) from e
+
         reset_request_counter()
         reset_risk_state()
         configure_budget(max_requests=max_requests, max_minutes=max_minutes)
+        configure_daily_quota(max_requests_per_day, base_path.get('quota'))
         all_filtered_comments = []
         all_final_users = []
         seen_user_ids: set = set()
@@ -455,6 +490,9 @@ if __name__ == '__main__':
             delay_range=(5.0, 15.0),      # 每次请求随机等待 5~15s
             cooldown_every=10,            # 每 10 次触发冷却
             cooldown_range=(60.0, 120.0), # 冷却 60~120s
+            max_requests_per_day=300,     # 单个身份单日请求上限（跨重启累计）
         )
     except SessionExpiredError as e:
         logger.error(f'[Pipeline] Cookie 已失效，请重新获取 Cookie 后重试。详情: {e}')
+    except SignatureStaleError as e:
+        logger.error(f'[Pipeline] 签名疑似过期，请更新 static/ 下的签名 JS。详情: {e}')

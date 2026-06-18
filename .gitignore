@@ -4,6 +4,7 @@ node_modules/
 datas/
 .xhs_profile/
 .xhs_cookies_live
+.xhs_quota.json
 *.so
 .Python
 build/

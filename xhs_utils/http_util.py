@@ -34,12 +34,14 @@ which matter most when there is no proxy/IP rotation to fall back on:
 """
 from __future__ import annotations
 
+import json
 import math
 import os
 import random
 import re
 import threading
 import time
+from datetime import datetime
 from typing import Any, Optional
 
 from loguru import logger
@@ -185,7 +187,34 @@ _budget_state: dict[str, Any] = {
     "max_seconds": None,
     "started_at": None,
     "request_count": 0,
+    # Per-day quota that survives process restarts — a single IP/cookie should
+    # not be able to bypass throttling just by relaunching the script.
+    "max_daily": None,
+    "daily_path": None,
+    "daily_date": None,
+    "daily_count": 0,
 }
+
+
+def _today_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def _read_daily_quota(path: str) -> tuple[Optional[str], int]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("date"), int(data.get("count", 0))
+    except Exception:
+        return None, 0
+
+
+def _write_daily_quota(path: str, date: str, count: int) -> None:
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"date": date, "count": count}, f)
+    except Exception as e:
+        logger.debug(f"[Budget] daily quota write failed: {e}")
 
 
 def configure_budget(
@@ -206,17 +235,61 @@ def configure_budget(
     )
 
 
+def configure_daily_quota(max_daily: Optional[int], path: Optional[str]) -> None:
+    """Set a per-calendar-day request cap that persists across runs.
+
+    Loads today's running total from ``path`` so relaunching the script keeps
+    counting toward the same daily budget instead of starting fresh.
+    """
+    with _budget_lock:
+        _budget_state["max_daily"] = max_daily
+        _budget_state["daily_path"] = path
+        today = _today_str()
+        if max_daily is not None and path:
+            saved_date, saved_count = _read_daily_quota(path)
+            _budget_state["daily_date"] = today
+            _budget_state["daily_count"] = saved_count if saved_date == today else 0
+            used = _budget_state["daily_count"]
+        else:
+            _budget_state["daily_date"] = today
+            _budget_state["daily_count"] = 0
+            used = 0
+    logger.info(f"[Budget] daily quota max_daily={max_daily} (today used={used})")
+
+
 def _consume_budget() -> None:
-    """Record one request; raise if it pushes us over either cap."""
+    """Record one request; raise if it pushes us over any cap."""
+    daily_path = None
+    daily_date = None
+    daily_count = None
+    max_daily = None
     with _budget_lock:
         _budget_state["request_count"] += 1
         c = _budget_state["request_count"]
         max_r = _budget_state["max_requests"]
         max_s = _budget_state["max_seconds"]
         started = _budget_state["started_at"]
+        max_daily = _budget_state["max_daily"]
+        if max_daily is not None:
+            today = _today_str()
+            if _budget_state["daily_date"] != today:  # rolled past midnight
+                _budget_state["daily_date"] = today
+                _budget_state["daily_count"] = 0
+            _budget_state["daily_count"] += 1
+            daily_count = _budget_state["daily_count"]
+            daily_date = _budget_state["daily_date"]
+            daily_path = _budget_state["daily_path"]
+
+    if daily_path and daily_date is not None and daily_count is not None:
+        _write_daily_quota(daily_path, daily_date, daily_count)
+
     if max_r is not None and c > max_r:
         raise SessionBudgetExceeded(
             f"request count {c} exceeded max_requests={max_r}"
+        )
+    if max_daily is not None and daily_count is not None and daily_count > max_daily:
+        raise SessionBudgetExceeded(
+            f"daily request count {daily_count} exceeded max_daily={max_daily}"
         )
     if max_s is not None and started is not None:
         elapsed = time.time() - started
@@ -287,6 +360,17 @@ def raise_if_circuit_open() -> None:
     with _risk_lock:
         if _risk_state["open"]:
             raise CircuitBreakerOpen("circuit breaker already open")
+
+
+def is_risk_message(msg: Any) -> bool:
+    """True if a business message reads like a risk-control / rate-limit reply.
+
+    Lets callers that only have ``(success, msg)`` (e.g. the pipeline preflight)
+    tell a风控 soft-block apart from a login failure or a stale signature.
+    """
+    s = str(msg or "")
+    low = s.lower()
+    return any(k in s for k in _RISK_KEYWORDS) or any(k in low for k in _RISK_KEYWORDS_EN)
 
 
 def _classify_response(status: Optional[int], body: Any) -> tuple[str, Any, str]:
@@ -505,12 +589,37 @@ def Session(*args: Any, **kwargs: Any) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# Pacing — lognormal delays + cooldowns
+# Pacing — lognormal delays + cooldowns + circadian (昼夜节律)
 # ---------------------------------------------------------------------------
+#
+# A real person doesn't browse at a constant rate around the clock — they skim
+# during the day and barely touch the app at 3am. With a single identity, an
+# evenly-paced 24/7 request stream is a tell. We scale all pauses by a
+# time-of-day factor: ~1x in active hours, slower in the shoulders, much slower
+# deep at night. Toggle with XHS_CIRCADIAN=0; tune the active window with
+# XHS_ACTIVE_HOUR_START / XHS_ACTIVE_HOUR_END (local time, 24h).
 
 
 _request_counter = 0
 _counter_lock = threading.Lock()
+
+_CIRCADIAN_ENABLED = os.getenv("XHS_CIRCADIAN", "1").lower() not in ("0", "false", "no", "")
+_ACTIVE_HOUR_START = int(os.getenv("XHS_ACTIVE_HOUR_START", "9"))
+_ACTIVE_HOUR_END = int(os.getenv("XHS_ACTIVE_HOUR_END", "23"))
+_NIGHT_FACTOR = float(os.getenv("XHS_NIGHT_FACTOR", "4.0"))
+_SHOULDER_FACTOR = float(os.getenv("XHS_SHOULDER_FACTOR", "2.0"))
+
+
+def circadian_factor(now: Optional[datetime] = None) -> float:
+    """Delay multiplier for the current local hour (1.0 = active baseline)."""
+    if not _CIRCADIAN_ENABLED:
+        return 1.0
+    h = (now or datetime.now()).hour
+    if 1 <= h < 7:  # deep night
+        return _NIGHT_FACTOR
+    if _ACTIVE_HOUR_START <= h < _ACTIVE_HOUR_END:
+        return 1.0
+    return _SHOULDER_FACTOR  # early morning / late night shoulders
 
 
 def _lognormal_seconds(median: float, sigma: float, cap: float) -> float:
@@ -526,8 +635,9 @@ def _lognormal_seconds(median: float, sigma: float, cap: float) -> float:
 
 def random_delay(min_seconds: float = 2.0, max_seconds: float = 5.0) -> None:
     """Lognormal delay scaled to the [min, max] band (with floor + ~6x cap)."""
-    median = math.sqrt(min_seconds * max_seconds)
-    cap = max_seconds * 6.0
+    factor = circadian_factor()
+    median = math.sqrt(min_seconds * max_seconds) * factor
+    cap = max_seconds * 6.0 * factor
     delay = max(min_seconds * 0.4, _lognormal_seconds(median, 0.7, cap))
     time.sleep(delay)
 
@@ -544,24 +654,26 @@ def rate_limited_delay(
     Distribution: lognormal centered at the geometric mean of [min, max] with
     sigma=0.7, capped at 6x ``max_seconds``. The heavy tail naturally produces
     the rare 60-90s "deep read" pause that real users do — no hand-coded
-    probability branches needed.
+    probability branches needed. All pauses are scaled by ``circadian_factor``.
     """
     global _request_counter
     with _counter_lock:
         _request_counter += 1
         count = _request_counter
 
+    factor = circadian_factor()
+
     if count % cooldown_every == 0:
-        delay = random.uniform(cooldown_min, cooldown_max)
-        logger.info(f"[限速] 已发送 {count} 次请求，触发冷却 {delay:.0f}s")
+        delay = random.uniform(cooldown_min, cooldown_max) * factor
+        logger.info(f"[限速] 已发送 {count} 次请求，触发冷却 {delay:.0f}s (昼夜系数 {factor:g})")
         time.sleep(delay)
         return
 
-    median = math.sqrt(min_seconds * max_seconds)
-    cap = max_seconds * 6.0
+    median = math.sqrt(min_seconds * max_seconds) * factor
+    cap = max_seconds * 6.0 * factor
     delay = max(min_seconds * 0.4, _lognormal_seconds(median, 0.7, cap))
     if delay > max_seconds * 1.5:
-        logger.debug(f"[限速] 长尾停顿 {delay:.1f}s")
+        logger.debug(f"[限速] 长尾停顿 {delay:.1f}s (昼夜系数 {factor:g})")
     time.sleep(delay)
 
 

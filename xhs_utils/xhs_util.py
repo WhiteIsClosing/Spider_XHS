@@ -131,6 +131,31 @@ def generate_headers(a1, api, data='', method='POST', referer=None):
         data = json.dumps(data, separators=(',', ':'), ensure_ascii=False)
     return headers, data
 
+def verify_signature_toolchain():
+    """Offline sanity check that the signing JS toolchain actually runs.
+
+    Catches a missing/broken Node, an execjs failure, or a corrupted static JS
+    bundle *before* the crawl burns the cookie firing malformed signatures at
+    the server. Raises RuntimeError (with guidance) on failure; returns the
+    probe signature on success.
+    """
+    probe_a1 = 'a' * 52
+    api = '/api/sns/web/v1/homefeed/category'
+    try:
+        xs, xt, xs_common = generate_xs_xs_common(probe_a1, api, '', 'GET')
+    except Exception as e:
+        raise RuntimeError(
+            f'签名工具链不可用（execjs/Node 执行失败）: {e}。'
+            f'请确认已安装 Node.js，且 static/ 目录下的签名 JS 完整。'
+        ) from e
+    if not (xs and xt and str(xs_common).strip()):
+        raise RuntimeError(
+            '签名工具链返回空值（x-s / x-t / x-s-common 之一为空），签名 JS 可能损坏'
+            '或与当前版本不匹配，请更新 static/ 目录下的签名脚本。'
+        )
+    return {'x-s': xs, 'x-t': xt, 'x-s-common': xs_common}
+
+
 def generate_request_params(cookies_str, api, data='', method='POST', referer=None):
     cookies = trans_cookies(cookies_str)
     a1 = cookies['a1']
