@@ -25,6 +25,7 @@ from xhs_utils.http_util import (
 )
 from xhs_utils.xhs_util import verify_signature_toolchain
 from xhs_utils.llm_util import analyze_dating_tendency, is_marketing_account
+from xhs_utils.seen_util import SeenStore, DEFAULT_NOTE_TTL_DAYS
 
 
 class SessionExpiredError(Exception):
@@ -245,6 +246,7 @@ class Data_Spider():
         max_requests: int = 80,
         max_minutes: float = 30.0,
         max_requests_per_day: int = 300,
+        note_ttl_days: float = DEFAULT_NOTE_TTL_DAYS,
         proxies: dict = None,
     ):
         """
@@ -266,6 +268,9 @@ class Data_Spider():
         :param max_requests            单次会话最大请求数，超过后保存部分结果并退出
         :param max_minutes             单次会话最大墙钟分钟，到点保存部分结果并退出
         :param max_requests_per_day    单个身份单日最大请求数（跨重启持久化），默认 300
+        :param note_ttl_days           笔记去重过期天数（跨运行持久化）：处理过的笔记在
+                                       此天数内跳过，超过后允许重新爬以捞新评论，默认 3 天。
+                                       用户为永久去重，不受此参数影响。
         :param proxies                 代理配置
         """
         # 启动自检：签名工具链能否离线跑通（Node/execjs/静态 JS 完整性）
@@ -281,6 +286,8 @@ class Data_Spider():
         configure_daily_quota(max_requests_per_day, base_path.get('quota'))
         all_filtered_comments = []
         all_final_users = []
+        # 跨运行去重：用户永久跳过，笔记 note_ttl_days 天后允许重爬
+        seen_store = SeenStore(base_path.get('seen'), note_ttl_days=note_ttl_days)
         seen_user_ids: set = set()
 
         # 健康检查：pipeline 启动前确认 cookie 有效
@@ -330,6 +337,13 @@ class Data_Spider():
         skipped = len([n for n in notes if n.get('model_type') == 'note']) - len(valid_notes)
         if skipped:
             logger.info(f'[Pipeline] 跳过零评论笔记 {skipped} 篇')
+
+        # 跨运行去重：跳过 note_ttl_days 天内已处理过的笔记
+        before_dedup = len(valid_notes)
+        valid_notes = [n for n in valid_notes if not seen_store.note_fresh(n.get('id'))]
+        note_deduped = before_dedup - len(valid_notes)
+        if note_deduped:
+            logger.info(f'[Pipeline] 跳过近 {note_ttl_days} 天已爬过的笔记 {note_deduped} 篇')
         random.shuffle(valid_notes)
         logger.info(f'[Pipeline] 有效笔记 {len(valid_notes)} 篇（已打乱顺序），开始深度优先处理')
 
@@ -350,6 +364,8 @@ class Data_Spider():
                         raise SessionExpiredError(f'爬评论时 Cookie 失效: {msg}')
                     logger.warning(f'[Pipeline] 评论获取失败 {note_url}: {msg}')
                     continue
+                # 评论已成功拉取，记下该笔记的处理时间（note_ttl_days 天内不再重爬）
+                seen_store.mark_note(note['id'])
 
                 note_comments = []
                 for comment in out_comments:
@@ -364,7 +380,9 @@ class Data_Spider():
                 # Steps 4-6: 对本篇新出现的候选用户逐一完成全流程
                 for c in filtered:
                     uid = c.get('user_id')
-                    if not uid or uid in seen_user_ids:
+                    # 本次运行内去重 + 跨运行永久去重（含此前已被过滤掉的用户，
+                    # 避免下次再花请求重新拉取、重新判定）
+                    if not uid or uid in seen_user_ids or seen_store.user_seen(uid):
                         continue
                     seen_user_ids.add(uid)
 
@@ -383,6 +401,8 @@ class Data_Spider():
                     except Exception as e:
                         logger.warning(f'[Pipeline] 用户信息解析失败 {uid}: {e}')
                         continue
+                    # 已成功取到画像，无论后续是否被过滤都永久标记，下次不再重复拉取
+                    seen_store.mark_user(uid)
 
                     # Step 5: 人口属性过滤（性别 / 年龄 / 粉丝数）
                     if not filter_users([user_info], user_filter_genders, user_filter_age_range, user_filter_fans_max):
@@ -444,6 +464,9 @@ class Data_Spider():
         user_csv = os.path.join(base_path['excel'], f'{safe_query}_用户_{ts}.csv')
         save_to_csv(all_filtered_comments, comment_csv, type='comment')
         save_to_csv(all_final_users, user_csv, type='user')
+
+        # 持久化去重记录，供下次运行跳过已爬笔记 / 已处理用户
+        seen_store.save()
 
         # 持久化滚动后的 cookie，供下次同身份运行复用（养活这唯一的 cookie）
         live_path = base_path.get('cookie_live')

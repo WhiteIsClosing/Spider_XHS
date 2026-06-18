@@ -5,6 +5,7 @@ datas/
 .xhs_profile/
 .xhs_cookies_live
 .xhs_quota.json
+.xhs_seen.json
 *.so
 .Python
 build/
